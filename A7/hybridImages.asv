@@ -1,0 +1,147 @@
+set2_far = im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/A7/Set2/josh.jpg'));  % "far" picture
+set2_near = im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/A7/Set2/thanos.png')); % "near" picture
+% (Optional) convert images to grayscale
+% set2_far = rgb2gray(set2_far);                
+% set2_near = rgb2gray(set2_near);
+
+% Interactively get two pairs of points from each image to establish
+% alignment.
+[x1, y1, x2, y2] = get_points_interactively(set2_near, set2_far)
+
+
+[set2_near_aligned, set2_far_aligned] = align_images(set2_near, set2_far, x1, y1, x2, y2);
+
+% Choose the cutoff frequencies for the low-pass and high-pass filters
+% CHOOSE CAREFULLY!  Values will depend on the images used!
+cutoff_low  = 15;   % provide a value for the low-pass filter cutoff frequency (sigma of gaussian)
+cutoff_high = 10;   % provide a value for the high-pass filter cutoff frequency (sigma of gaussian)
+
+
+% Compute the hybrid image (you supply this code)
+set2_hybrid = hybridImage(set2_far_aligned, set2_near_aligned, cutoff_low, cutoff_high);
+
+% Crop resulting image:  Crop the result to get rid of any unsightly borders areas.
+disp('input crop points (two opposite corners)');
+fig=figure; hold off, imagesc(set2_hybrid), axis image;
+figure(fig)
+[x, y] = ginput(2);  x = round(x); y = round(y);
+close(fig);
+% Once you have these coordinates, comment the lines above, and 
+% hard code the values below.
+% x = [..]; y = [..];
+set2_hybrid = set2_hybrid(min(y):max(y), min(x):max(x), :);
+
+% Let us try to "simulate" what the hybrid image will look like
+% when viewed from afar.  Let us pad a black border around it
+% so it effectively shrinks in size when displayed in a montage.
+[h, w, ~] = size(set2_hybrid);
+viewed_from_afar = padarray(set2_hybrid, max(h, w));
+figure; montage({set2_near, set2_far, set2_hybrid, viewed_from_afar}, 'Size', [2,2]);
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Your function appears below 
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function im12 = hybridImage(im1, im2, cutoff_low, cutoff_high)
+    im1 = fftshift(fft2(im1));
+    im2 = fftshift(fft2(im2));
+
+    % low image
+    [h1, w1] = size(im1);
+    gauss = fspecial("gaussian", [h1, w1], cutoff_low);
+    gauss = gauss / max(gauss(:));  % need to scale so max of gaussian is 1
+    I_fft_low = im1 .* gauss;
+    I_low = ifft2(ifftshift(I_fft_low));  % apply filter 
+
+    % 
+    
+end
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% Helper functions. (You DO NOT need to change)
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+function [x1, y1, x2, y2] = get_points_interactively(im1, im2)
+    % displays image and gets two points from the user
+    fig=figure; hold off, imagesc(im1), axis image;
+    disp('Select two points from each image define rotation, scale, translation')
+    figure(fig)
+    [x1, y1] = ginput(2);
+    figure(fig); hold off, imagesc(im2), axis image;
+    figure(fig)
+    [x2, y2] = ginput(2);
+    close(fig);
+end
+
+function [im1, im2] = align_images(im1, im2, x1, y1, x2, y2)
+    % Aligns im1 and im2 (translation, scale, rotation) after getting two pairs
+    % of points from the user.  In the output of im1 and im2, the two pairs of
+    % points will have approximately the same coordinates.
+    
+    % get image sizes
+    [h1, w1, ~] = size(im1);
+    [h2, w2, ~] = size(im2);
+    
+    cx1 = mean(x1); cy1 = mean(y1);
+    cx2 = mean(x2); cy2 = mean(y2);
+    
+    % translate first so that center of ref points is center of image
+    tx = round((w1/2-cx1)*2);
+    if tx > 0,  im1 = padarray(im1, [0 tx], 'pre');
+    else        im1 = padarray(im1, [0 -tx], 'post');
+    end
+    ty = round((h1/2-cy1)*2);
+    if ty > 0,  im1 = padarray(im1, [ty 0], 'pre');
+    else        im1 = padarray(im1, [-ty 0], 'post');
+    end  
+    tx = round((w2/2-cx2)*2) ;
+    if tx > 0,  im2 = padarray(im2, [0 tx], 'pre');
+    else        im2 = padarray(im2, [0 -tx], 'post');
+    end
+    ty = round((h2/2-cy2)*2);
+    if ty > 0,  im2 = padarray(im2, [ty 0], 'pre');
+    else        im2 = padarray(im2, [-ty 0], 'post');
+    end
+    
+    % downscale larger image so that lengths between ref points are the same
+    len1 = sqrt((y1(2)-y1(1)).^2+(x1(2)-x1(1)).^2);
+    len2 = sqrt((y2(2)-y2(1)).^2+(x2(2)-x2(1)).^2);
+    dscale = len2 ./ len1;
+    if dscale < 1
+        im1 = imresize(im1, dscale, 'bilinear'); 
+    else
+        im2 = imresize(im2, 1./dscale, 'bilinear');
+    end
+    
+    % rotate im1 so that angle between points is the same
+    theta1 = atan2(-(y1(2)-y1(1)), x1(2)-x1(1)); % in matlab, y==1 is at the top of the N x M image, and y==N is at the bottom
+    theta2 = atan2(-(y2(2)-y2(1)), x2(2)-x2(1));
+    dtheta = theta2-theta1;
+    im1 = imrotate(im1, dtheta*180/pi, 'bilinear'); % imrotate uses degree units
+    
+    % Crop images (on both sides of border) to be same height and width
+    [h1, w1, ~] = size(im1);
+    [h2, w2, ~] = size(im2);
+    
+    minw = min(w1, w2);
+    brd = (max(w1, w2)-minw)/2;
+    if minw == w1 % crop w2
+        im2 = im2(:, (ceil(brd)+1):end-floor(brd), :);
+        tx = tx-ceil(brd);
+    else
+        im1 = im1(:, (ceil(brd)+1):end-floor(brd), :);
+        tx = tx+ceil(brd);    
+    end
+    
+    minh = min(h1, h2);
+    brd = (max(h1, h2)-minh)/2;
+    if minh == h1 % crop w2
+        im2 = im2((ceil(brd)+1):end-floor(brd), :, :);
+        ty = ty-ceil(brd);
+    else
+        im1 = im1((ceil(brd)+1):end-floor(brd), :, :);
+        ty = ty+ceil(brd);    
+    end    
+end
