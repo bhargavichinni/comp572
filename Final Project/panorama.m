@@ -1,0 +1,268 @@
+% PANORAMA_SIMILARITY_FROM_URLS
+% Interactively build a panorama from 5 images using:
+%   - Similarity transforms (scale + rotation + translation)
+%     estimated from TWO corresponding point pairs between
+%     each neighboring image.
+%   - Distance-transform based feather blending to hide seams.
+%   - Final sharpening to reduce blur.
+
+close all; clc;
+
+%% function to create the panorama
+function pan_Im = make_image(imgs, coords, crop)
+
+    % Step 2: initialize global transforms
+    tforms(5) = projective2d(eye(3));
+    tforms(1) = projective2d(eye(3));   % image 1 is the reference
+
+    % Step 3: Similarity transform
+    for n = 2:5
+        fprintf('\n=== Pair (%d <- %d): FIXED = %d (left), MOVING = %d (right) ===\n',...
+                n-1, n, n-1, n);
+    
+        fixedImg  = imgs{n-1};  % left image in the sequence
+        movingImg = imgs{n};    % right image in the sequence
+    
+        % Get point pairs interactively
+        %[xFixed, yFixed, xMoving, yMoving] = get_two_points(fixedImg, movingImg);
+        %coords{n-1} = {xFixed, yFixed, xMoving, yMoving};
+        [xFixed, yFixed, xMoving, yMoving] = coords{n-1}{:};
+    
+        fixedPts  = [xFixed(:)  yFixed(:)];     % [x', y'] in fixed image
+        movingPts = [xMoving(:) yMoving(:)];    % [x,  y ] in moving image
+    
+        % Compute similarity transform (COLUMN form) mapping moving -> fixed:
+        H_pair_col = similarity_from_two_pairs(movingPts, fixedPts);
+    
+        % Chain into global frame of image 1:
+        %   H_global(n) = H_global(n-1) * H_pair
+        % tforms(k).T is ROW-vector form; transpose to get COLUMN form.
+        H_prev_col = tforms(n-1).T.';          % 3x3, column style
+        H_global_col = H_prev_col * H_pair_col;
+        tforms(n) = projective2d(H_global_col.');  % back to row form for projective2d
+    end
+    celldisp(coords);
+
+    % Step 4: make panorama canvas
+    xLimits = zeros(5,2);
+    yLimits = zeros(5,2);
+    
+    for i = 1:5
+        [h, w, ~] = size(imgs{i});
+        [xLimits(i,:), yLimits(i,:)] = outputLimits(tforms(i), [1 w], [1 h]);
+    end
+    
+    xMin = floor(min(xLimits(:)));
+    xMax = ceil(max(xLimits(:)));
+    yMin = floor(min(yLimits(:)));
+    yMax = ceil(max(yLimits(:)));
+    
+    widthPan  = xMax - xMin + 1;
+    heightPan = yMax - yMin + 1;
+    
+    panoramaRef = imref2d([heightPan, widthPan], [xMin xMax], [yMin yMax]);
+
+    % Step 5: warp and blend images
+    pan_Im  = zeros(heightPan, widthPan, 3);
+    weightSum = zeros(heightPan, widthPan);   % sum of weights per pixel
+    
+    for i = 1:5
+        fprintf('Warping image %d into panorama...\n', i);
+        img   = imgs{i};
+        tform = tforms(i);
+    
+        % Warp image into panorama canvas
+        warped = imwarp(img, tform, 'OutputView', panoramaRef, 'FillValues', 0);
+    
+        % Valid-pixel mask
+        validMask = any(warped > 0, 3);
+    
+        if ~any(validMask(:))
+            continue; % nothing contributed
+        end
+    
+        % Distance transform-based weight:
+        % high weight in the interior, decays toward edges, zero outside.
+        distMap = bwdist(~validMask);
+        distMap(~validMask) = 0;
+    
+        % Normalize weights to [0,1]
+        distMap = distMap / max(distMap(:));
+    
+        % Optionally sharpen the interior weighting a bit
+        weight = distMap .^ 1.0;   % power 1 => linear; >1 => more interior emphasis
+    
+        % Accumulate weighted colors and weights
+        for c = 1:3
+            layer = pan_Im(:,:,c);
+            layer = layer + warped(:,:,c) .* weight;
+            pan_Im(:,:,c) = layer;
+        end
+    
+        weightSum = weightSum + weight;
+    end
+    
+    % Normalize final colors by total weight
+    epsVal = 1e-6;
+    valid = weightSum > epsVal;
+    for c = 1:3
+        layer = pan_Im(:,:,c);
+        layer(valid) = layer(valid) ./ weightSum(valid);
+        pan_Im(:,:,c) = layer;
+    end
+
+    % Step 6: Sharpen image and crop to final panorama
+    pan_Im = imsharpen(pan_Im, 'Radius', 1.5, 'Amount', 1.0);
+    figure; imshow(pan_Im);
+    title('Panorama before cropping. Draw rectangle and double-click to confirm.');
+
+    %hRect = drawrectangle;  % interactive ROI
+    %wait(hRect);            % waits for double-click confirmation
+    %pos = round(hRect.Position);  % [x, y, width, height]
+    %disp(pos);
+    
+    pan_Im = imcrop(pan_Im, crop);  % final cropped panorama!!
+    close all;
+
+end
+
+
+%% =====================================================================
+% Helper: ask for 2 corresponding points in fixed, then moving image
+function [x1, y1, x2, y2] = get_two_points(imFixed, imMoving)
+    fig = figure;
+    hold off; imagesc(imFixed); axis image;
+    title('FIXED (left) image: click TWO points');
+    disp('Select TWO points in the FIXED (left) image...');
+    [x1, y1] = ginput(2);
+
+    figure(fig); hold off; imagesc(imMoving); axis image;
+    title('MOVING (right) image: click the SAME TWO points (same order)');
+    disp('Select the SAME TWO points (same order) in the MOVING (right) image...');
+    [x2, y2] = ginput(2);
+
+    close(fig);
+end
+
+%% =====================================================================
+% Helper: build similarity transform from TWO point pairs
+function H_col = similarity_from_two_pairs(movingPts, fixedPts)
+    if size(movingPts,1) ~= 2 || size(fixedPts,1) ~= 2
+        error('Need exactly two point pairs.');
+    end
+
+    p1 = movingPts(1,:).';
+    p2 = movingPts(2,:).';
+    q1 = fixedPts(1,:).';
+    q2 = fixedPts(2,:).';
+
+    % Vectors between the point pairs
+    v_p = p2 - p1;
+    v_q = q2 - q1;
+
+    % Scale
+    len_p = norm(v_p);
+    len_q = norm(v_q);
+    if len_p == 0
+        error('Moving points must not be identical.');
+    end
+    s = len_q / len_p;
+
+    % Rotation
+    ang_p = atan2(v_p(2), v_p(1));
+    ang_q = atan2(v_q(2), v_q(1));
+    theta = ang_q - ang_p;
+
+    c = cos(theta);
+    sn = sin(theta);
+
+    R = [c -sn; sn c];
+
+    % Translation: q1 = s*R*p1 + t  =>  t = q1 - s*R*p1
+    t = q1 - s * (R * p1);
+
+    % Build 3x3 column-form matrix
+    % x' = s*(R(1,:)*[x;y]) + t(1)
+    % y' = s*(R(2,:)*[x;y]) + t(2)
+    H_col = [ s*R(1,1), s*R(1,2), t(1);
+              s*R(2,1), s*R(2,2), t(2);
+              0,        0,        1   ];
+end
+
+
+%% Load all sets of images (left to right)
+set1 = {
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set1/1.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set1/2.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set1/3.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set1/4.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set1/5.JPG')), -90)
+};
+
+set2 = {
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set2/1.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set2/2.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set2/3.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set2/4.JPG')), -90)
+    imrotate(im2double(imread('https://raw.githubusercontent.com/bhargavichinni/comp572/main/Final Project/Set2/5.JPG')), -90)
+};
+
+%% Hard coded image pair coordinates from running this code interactively
+coord1 = {
+    { [2320.7  2587.1],    [1215.2  1509.1],    [1044.1  1301.3],    [1196.8  1490.7]  }
+    { [1540.1  1944.2],    [2271.4  2354.0],    [226.6686  750.1856],    [2262.2  2317.3]  }
+    { [979.8  1420.7],    [2106.0  2445.9],    [153.1925  630.7870],    [2197.9  2501.0]  }
+    { [1576.8  2210.5],    [2620.4  2868.4],    [640.0  1264.5],    [2611.2  2813.3]  }
+};
+
+coord2 = {
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+};
+
+coord3 = {
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+};
+
+coord4 = {
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+};
+
+coord5 = {
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+    { [x4f1  x4f2],    [y4f1  y4f2],    [x4m1  x4m2],    [y4m1  y4m2]  }
+};
+
+%% Hard coded crop coordinates from running this code interactively
+crop1 = [1 1079 6410 2187];
+crop2 = [];
+crop3 = [];
+crop4 = [];
+crop5 = [];
+
+%% Run the function on all sets of images
+% Set 1
+pan1 = make_image(set1, coord1, crop1);
+figure; 
+subplot(2,1,1); montage(set1, 'Size', [1 5], 'BorderSize', [10 10]);
+title('Set 1: Source Images');
+subplot(2,1,2); imshow(pan1);
+title('Set 1: Panorama');
+
+% Set 2
+pan2 = make_image(set2, coord2, crop2);
+figure; 
+subplot(2,1,1); montage(set2, 'Size', [1 5], 'BorderSize', [10 10]);
+title('Set 2: Source Images');
+subplot(2,1,2); imshow(pan1);
+title('Set 2: Panorama');
